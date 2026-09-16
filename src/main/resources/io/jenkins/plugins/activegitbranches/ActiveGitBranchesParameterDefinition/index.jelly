@@ -2,7 +2,7 @@
 <j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" 
          xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:f="/lib/form">
 
-    <st:adjunct includes="io.jenkins.plugins.activegitbranches.ActiveGitBranchesParameterDefinition.index" />
+    <st:adjunct includes="io.jenkins.plugins.activegitbranches.ActiveGitBranchesParameterDefinition.active-git-branches" />
 
     <f:entry title="${it.name}" description="${it.description}">
         <div name="parameter" class="active-git-branches-parameter" data-agb-name="${it.name}">
@@ -13,13 +13,16 @@
             <j:set var="effectiveDefault" value="${it.effectiveDefaultValue}" />
             <j:choose>
                 <j:when test="${empty(branches) and !it.allowCustomBranch}">
-                    <select name="value" class="setting-input" disabled="disabled">
-                        <option value="">-- No branches available --</option>
-                    </select>
+                    <div class="jenkins-select">
+                        <select name="value" class="jenkins-select__input" disabled="disabled">
+                            <option value="">-- No branches available --</option>
+                        </select>
+                    </div>
                     <div class="error">Unable to fetch branches from repository. Please check the configuration.</div>
                 </j:when>
                 <j:otherwise>
-                    <select name="value" class="setting-input agb-select">
+                    <div class="jenkins-select">
+                    <select name="value" class="jenkins-select__input agb-select">
                         <j:forEach var="branch" items="${branches}">
                             <j:choose>
                                 <j:when test="${branch.disabled}">
@@ -38,9 +41,10 @@
                             <option value="__custom__">✏ Custom (manual input)...</option>
                         </j:if>
                     </select>
+                    </div>
                     <j:if test="${it.allowCustomBranch}">
                         <div class="agb-custom-wrapper">
-                            <input type="text" name="customValue" class="setting-input agb-custom-input"
+                            <input type="text" name="customValue" class="jenkins-input agb-custom-input"
                                    placeholder="Enter branch name (e.g. feature/my-branch)"
                                    autocomplete="off" disabled="disabled" />
                             <div class="agb-custom-hint">

@@ -1,5 +1,4 @@
 .agb-disabled-option {
-    color: #999;
     font-style: italic;
 }
 
@@ -12,17 +11,17 @@
 }
 
 .agb-custom-hint {
-    color: #666;
+    color: var(--text-color-secondary);
     font-size: 11px;
     margin-top: 2px;
 }
 
 .agb-cache-meta {
-    color: #888;
+    color: var(--text-color-secondary);
     font-size: 11px;
     margin-top: 3px;
 }
 
 .agb-refresh-warning {
-    color: #b08800;
+    color: var(--warning-color);
 }
