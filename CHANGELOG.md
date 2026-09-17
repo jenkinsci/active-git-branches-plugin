@@ -10,6 +10,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Documentation
+- Enhanced README with emoji icons and visual hierarchy for better readability and engagement
+- Improved feature comparison table with ✅/❌/⚠️ symbols for clearer visual communication
+- Added structured emoji-tagged sections for features, use cases, prerequisites, configuration, and troubleshooting
+- Expanded Chinese translation (README.zh-CN.md) with comprehensive content and formatting improvements
+
+### 文档
+- 用 emoji 图标和视觉层次优化 README，提高可读性和吸引力
+- 改进功能对比表，使用 ✅/❌/⚠️ 符号增强信息的视觉传达
+- 添加带 emoji 标签的结构化章节（功能、使用场景、需求、配置、故障排查）
+- 完善中文翻译（README.zh-CN.md）内容和格式
+
+---
+
 ## [1.7.0] - 2026-09-07
 
 ### Added
