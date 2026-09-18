@@ -6,7 +6,7 @@
 
 **Active Git Branches Parameter** 提供一个 Jenkins 构建参数，让用户优先看到最可能要构建的分支：最近活跃的分支。你还可以通过过滤、数量限制、强制保留和禁选规则，让分支下拉框更贴近团队真实工作流。
 
-这个插件适合分支数量多、Feature/Release 分支频繁、或者一个 Jenkins workspace 中包含多个 Git 仓库的团队。
+这个插件适合分支数量多、Feature/Release 分支频繁的团队。
 
 ## 为什么选择这个插件？
 
@@ -17,7 +17,7 @@
 - **重要分支始终可见**：通过 `alwaysIncludeBranches` 保证 `main`、`develop` 等关键分支不会因为 Top N 限制被挤掉。
 - **不需要 Groovy 脚本审批**：使用专用 Java 参数类型，不依赖 Active Choices Groovy 脚本，也不需要 Script Approval。
 - **支持直接配置仓库地址**：适合在 Pipeline 中手动 `git checkout` 的项目，不依赖 Jenkins Job 的 SCM 配置。
-- **适合多仓 workspace**：可以自动识别 workspace 下一级子目录中的 Git 仓库，也支持手动配置 `subdirectory`。
+- **对 Controller 和 Git 服务器更友好**：指向同一仓库的 Job 共享同一份分支缓存，每分钟最多刷新一次。
 - **二次打开更快**：使用 stale-while-revalidate 缓存，页面可以先展示上一次分支列表，同时后台刷新最新数据。
 
 ## 适合哪些场景？
@@ -28,21 +28,20 @@
 - 想要一个简单的“只选分支”的构建参数，而不是维护 Groovy 脚本。
 - 私有仓库需要 Jenkins Credentials 支持。
 - 希望阻止用户从 `main`、`master` 或 release 分支发起某些构建，但又希望这些分支在 UI 中保持可见。
-- Pipeline 在 Jenkinsfile 或 workspace 子目录中 checkout 一个或多个仓库。
+- Pipeline 在 Jenkinsfile 中 checkout 一个或多个仓库，而不是使用 Job 的 SCM 配置。
 
 如果你需要选择 tag、pull request 或任意 revision，成熟的 [Git Parameter Plugin](https://plugins.jenkins.io/git-parameter/) 可能更适合。如果你需要 GitLab API 风格的 refs 加载，可以看看 [GitLab Repository Refs Parameter](https://plugins.jenkins.io/gitlab-repository-refs-parameter/)。
 
 ## 功能特性
 
 - 从指定 Git 仓库动态获取分支。
-- 在 workspace refs 或 full-clone 模式可用时，按分支最近提交时间排序。
+- 关闭 quick fetch 时，按分支最近提交时间排序。
 - 支持 quick fetch 模式，在不需要提交时间排序时快速列出远程分支。
 - 支持 Top N 限制，让下拉框更聚焦。
 - 支持 Java 正则表达式过滤分支。
 - 支持 always-include 规则，确保重要分支始终可见。
 - 支持 exclude/disable 规则，让特定分支可见但不可选。
 - 集成 Jenkins Credentials，支持私有仓库。
-- 支持 workspace 一级子目录自动检测和手动子目录配置。
 - 使用 stale-while-revalidate 缓存，提升 Build with Parameters 页面响应速度。
 
 ## 环境要求
@@ -62,22 +61,10 @@
 | Jenkins Credentials 集成 | 支持 | 支持 | 依赖脚本实现 | 支持 |
 | 不需要 Groovy 脚本审批 | 支持 | 支持 | 不支持 | 支持 |
 | 在 UI 中禁选保护分支 | 能力有限 | 能力有限 | 需要自定义脚本 | 支持 |
-| workspace 子目录仓库自动检测 | 依赖 SCM 配置 | 不支持 | 需要自定义脚本 | 支持 |
 
 ## 安装
 
-### 从源码构建
-
-1. 克隆本仓库。
-2. 构建插件：
-   ```bash
-   mvn clean package
-   ```
-3. 在 Jenkins 插件管理页面上传 `target/active-git-branches.hpi`。
-
-### Jenkins Update Center
-
-即将支持。
+在 **Manage Jenkins → Plugins → Available plugins** 中搜索并安装 **Active Git Branches Parameter**。
 
 ## 使用方式
 
@@ -160,9 +147,8 @@ node {
 | `branchFilter` | 否 | 用于过滤分支名的正则表达式 |
 | `alwaysIncludeBranches` | 否 | 必须始终包含在列表中的分支正则 |
 | `excludeBranches` | 否 | 禁止选择的分支正则，匹配后会置灰且不可选 |
-| `useQuickFetch` | 否 | 没有匹配 workspace 时，使用不带提交时间的快速远程分支列表，默认 `true` |
+| `useQuickFetch` | 否 | `true`：使用 `ls-remote` 快速列出分支，按字母排序；`false`：将各分支最新提交拉取到 Controller 上的缓存仓库，按提交时间排序。默认 `true` |
 | `defaultValue` | 否 | 默认选中的分支 |
-| `subdirectory` | 否 | workspace 内 Git 仓库相对路径；为空时自动检测 |
 | `allowCustomBranch` | 否 | 允许用户手动输入任意分支名，默认 `false` |
 | `description` | 否 | 参数描述 |
 
@@ -177,41 +163,14 @@ node {
 | `(?!release/).*` | 排除 release 分支 |
 | `hotfix-.*\|bugfix-.*` | 匹配 hotfix 或 bugfix 分支 |
 
-## 开发
-
-### 前置条件
-
-- JDK 17 或更高版本
-- Maven 3.8+
-
-### 构建
-
-```bash
-mvn clean package
-```
-
-### 本地运行
-
-```bash
-mvn hpi:run
-```
-
-该命令会启动一个本地 Jenkins 实例，并安装当前插件。默认地址为 `http://localhost:8080/jenkins`。
-
-### 运行测试
-
-```bash
-mvn test
-```
-
 ## 工作原理
 
 1. 用户打开 Build with Parameters 页面时，插件会根据配置解析 Git 分支。
-2. 如果找到匹配的 workspace Git 仓库，Jenkins 会执行轻量 fetch 并读取本地 refs，从而按提交时间排序。
-3. 如果没有 workspace，quick fetch 模式会优先使用远程 refs 提升速度；如果更关注时间排序，可以使用 full-clone 模式。
+2. 默认的 quick fetch 模式使用 `ls-remote` 列出远程分支，速度快，但按字母排序。所有 Git 操作都在 Controller 上执行，不会触碰 Job workspace。
+3. 关闭 quick fetch 后，插件只把每个分支的最新提交拉取到 `$JENKINS_HOME/caches/active-git-branches` 下的缓存仓库并按提交时间排序；首次之后只下载有变化的分支。
 4. 插件先应用 `branchFilter`，然后保留 `alwaysIncludeBranches`，再对其余分支应用 `maxBranchCount` 限制。
 5. 匹配 `excludeBranches` 的分支会保持可见但不可选，服务端校验也会阻止绕过规则。
-6. 后续页面加载会先返回缓存结果，同时后台刷新分支列表。
+6. 后续页面加载会直接返回缓存结果；缓存超过一分钟时会在后台刷新。仓库、凭据和获取模式相同的 Job 共享同一份缓存。
 
 ## 故障排查
 
@@ -223,8 +182,9 @@ mvn test
 
 ### 性能问题
 
-- 降低 `maxBranchCount`。
-- 首次加载可能较慢，因为 Jenkins 需要获取仓库信息。
+- 启用 `useQuickFetch`，跳过按提交时间排序。
+- 关闭 quick fetch 时首次加载较慢，因为需要把分支最新提交拉取到缓存仓库。
+- 可通过系统属性 `io.jenkins.plugins.activegitbranches.ActiveGitBranchesParameterDefinition.refreshIntervalSeconds`（默认 `60`）调整刷新间隔。
 
 ### 认证错误
 
@@ -234,7 +194,7 @@ mvn test
 
 ## 贡献
 
-欢迎提交 issue 和 pull request。
+欢迎提交 issue 和 pull request。构建与测试方法见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
 ## License
 

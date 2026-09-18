@@ -128,7 +128,7 @@ public class ActiveGitBranchesParameterDefinitionTest {
                         String.class,
                         String.class,
                         String.class,
-                        String.class)
+                        boolean.class)
                 .getAnnotation(RequirePOST.class));
     }
 
@@ -247,122 +247,6 @@ public class ActiveGitBranchesParameterDefinitionTest {
         assertTrue(str.contains("ActiveGitBranchesParameterValue"));
         assertTrue(str.contains("BRANCH"));
         assertTrue(str.contains("develop"));
-    }
-
-    @Test
-    public void testSubdirectorySetter() {
-        ActiveGitBranchesParameterDefinition param = new ActiveGitBranchesParameterDefinition(
-                "BRANCH",
-                "https://github.com/jenkinsci/jenkins.git",
-                10,
-                null
-        );
-
-        assertNull(param.getSubdirectory());
-        param.setSubdirectory("backend");
-        assertEquals("backend", param.getSubdirectory());
-    }
-
-    @Test
-    public void testIsSameGitUrl() {
-        // Identical URLs
-        assertTrue(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "https://github.com/org/repo.git", "https://github.com/org/repo.git"));
-
-        // With and without .git
-        assertTrue(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "https://github.com/org/repo.git", "https://github.com/org/repo"));
-
-        // SSH vs HTTPS
-        assertTrue(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "git@github.com:org/repo.git", "https://github.com/org/repo.git"));
-
-        // SSH vs HTTPS without .git
-        assertTrue(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "git@github.com:org/repo.git", "https://github.com/org/repo"));
-
-        // With trailing slash
-        assertTrue(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "https://github.com/org/repo/", "https://github.com/org/repo.git"));
-
-        // Case insensitivity
-        assertTrue(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "https://GitHub.com/Org/Repo.git", "https://github.com/org/repo.git"));
-
-        // Different repos should fail
-        assertFalse(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "https://github.com/org/backend.git", "https://github.com/org/frontend.git"));
-
-        // Different hosts should fail
-        assertFalse(ActiveGitBranchesParameterDefinition.isSameGitUrl(
-                "https://github.com/org/repo.git", "https://gitlab.com/org/repo.git"));
-
-        // Null checks
-        assertFalse(ActiveGitBranchesParameterDefinition.isSameGitUrl(null, "https://github.com/org/repo.git"));
-        assertFalse(ActiveGitBranchesParameterDefinition.isSameGitUrl("https://github.com/org/repo.git", null));
-    }
-
-    @Test
-    public void testFindGitWorkspaceSubdirectory() throws Exception {
-        java.io.File tempRoot = java.nio.file.Files.createTempDirectory("jenkins-ws-test-").toFile();
-        try {
-            // Create backend subdirectory with .git/config
-            java.io.File backendDir = new java.io.File(tempRoot, "backend");
-            java.io.File backendGit = new java.io.File(backendDir, ".git");
-            backendGit.mkdirs();
-            java.nio.file.Files.write(new java.io.File(backendGit, "config").toPath(),
-                    "[remote \"origin\"]\n\turl = git@github.com:org/backend.git\n".getBytes());
-
-            // Create frontend subdirectory with .git/config
-            java.io.File frontendDir = new java.io.File(tempRoot, "frontend");
-            java.io.File frontendGit = new java.io.File(frontendDir, ".git");
-            frontendGit.mkdirs();
-            java.nio.file.Files.write(new java.io.File(frontendGit, "config").toPath(),
-                    "[remote \"origin\"]\n\turl = git@github.com:org/frontend.git\n".getBytes());
-
-            hudson.FilePath ws = new hudson.FilePath(tempRoot);
-
-            // Test 1: Auto-detection for backend repo
-            ActiveGitBranchesParameterDefinition paramBackend = new ActiveGitBranchesParameterDefinition(
-                    "BRANCH", "https://github.com/org/backend.git", 10, null);
-            hudson.FilePath foundBackend = paramBackend.findGitWorkspace(ws);
-            assertNotNull(foundBackend);
-            assertEquals("backend", foundBackend.getName());
-
-            // Test 2: Auto-detection for frontend repo
-            ActiveGitBranchesParameterDefinition paramFrontend = new ActiveGitBranchesParameterDefinition(
-                    "BRANCH", "https://github.com/org/frontend.git", 10, null);
-            hudson.FilePath foundFrontend = paramFrontend.findGitWorkspace(ws);
-            assertNotNull(foundFrontend);
-            assertEquals("frontend", foundFrontend.getName());
-
-            // Test 3: Manual subdirectory override
-            ActiveGitBranchesParameterDefinition paramManual = new ActiveGitBranchesParameterDefinition(
-                    "BRANCH", "https://github.com/org/frontend.git", 10, null);
-            paramManual.setSubdirectory("frontend");
-            hudson.FilePath foundManual = paramManual.findGitWorkspace(ws);
-            assertNotNull(foundManual);
-            assertEquals("frontend", foundManual.getName());
-
-            // Test 4: Unknown repo returns null
-            ActiveGitBranchesParameterDefinition paramUnknown = new ActiveGitBranchesParameterDefinition(
-                    "BRANCH", "https://github.com/org/UnknownRepo.git", 10, null);
-            assertNull(paramUnknown.findGitWorkspace(ws));
-        } finally {
-            deleteRecursively(tempRoot);
-        }
-    }
-
-    private void deleteRecursively(java.io.File f) {
-        if (f.isDirectory()) {
-            java.io.File[] files = f.listFiles();
-            if (files != null) {
-                for (java.io.File child : files) {
-                    deleteRecursively(child);
-                }
-            }
-        }
-        f.delete();
     }
 
     @Test
@@ -498,5 +382,54 @@ public class ActiveGitBranchesParameterDefinitionTest {
         // When defaultValue is excluded, it should not return the excluded defaultValue
         param.setExcludeBranches("feature/.*");
         assertEquals("develop", param.getEffectiveDefaultValue());
+    }
+
+    @Test
+    public void testFilterAndLimit() {
+        ActiveGitBranchesParameterDefinition param = new ActiveGitBranchesParameterDefinition(
+                "BRANCH", "https://github.com/org/repo.git", 3, null);
+        param.setBranchFilter("feature/.*");
+        param.setAlwaysIncludeBranches("main");
+        param.setExcludeBranches("main");
+
+        java.util.List<ActiveGitBranchesParameterDefinition.BranchInfo> all = java.util.List.of(
+                new ActiveGitBranchesParameterDefinition.BranchInfo("feature/a", 500L),
+                new ActiveGitBranchesParameterDefinition.BranchInfo("bugfix/x", 400L),
+                new ActiveGitBranchesParameterDefinition.BranchInfo("feature/b", 300L),
+                new ActiveGitBranchesParameterDefinition.BranchInfo("feature/c", 200L),
+                new ActiveGitBranchesParameterDefinition.BranchInfo("main", 100L));
+
+        java.util.List<ActiveGitBranchesParameterDefinition.BranchInfo> result = param.filterAndLimit(all);
+
+        // main is always included (first) and disabled; the filter drops bugfix/x; the limit drops feature/c
+        assertEquals(java.util.List.of("main", "feature/a", "feature/b"),
+                result.stream().map(ActiveGitBranchesParameterDefinition.BranchInfo::getName).toList());
+        assertTrue(result.get(0).isDisabled());
+        assertFalse(result.get(1).isDisabled());
+    }
+
+    @Test
+    public void testFilterAndLimitKeepsSortOrderWhenUnderLimit() {
+        ActiveGitBranchesParameterDefinition param = new ActiveGitBranchesParameterDefinition(
+                "BRANCH", "https://github.com/org/repo.git", 10, null);
+        param.setAlwaysIncludeBranches("main");
+
+        java.util.List<ActiveGitBranchesParameterDefinition.BranchInfo> result = param.filterAndLimit(java.util.List.of(
+                new ActiveGitBranchesParameterDefinition.BranchInfo("feature/a", 500L),
+                new ActiveGitBranchesParameterDefinition.BranchInfo("main", 100L)));
+
+        assertEquals(java.util.List.of("feature/a", "main"),
+                result.stream().map(ActiveGitBranchesParameterDefinition.BranchInfo::getName).toList());
+    }
+
+    @Test
+    public void testCacheKeyIgnoresFilters() {
+        // Parameters that only differ in filters share one cached fetch
+        assertEquals(
+                new ActiveGitBranchesParameterDefinition.CacheKey("https://github.com/org/repo.git", "creds", true),
+                new ActiveGitBranchesParameterDefinition.CacheKey("https://github.com/org/repo.git", "creds", true));
+        assertNotEquals(
+                new ActiveGitBranchesParameterDefinition.CacheKey("https://github.com/org/repo.git", "creds", true),
+                new ActiveGitBranchesParameterDefinition.CacheKey("https://github.com/org/repo.git", "creds", false));
     }
 }

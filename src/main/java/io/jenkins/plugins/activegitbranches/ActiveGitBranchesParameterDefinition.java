@@ -5,43 +5,49 @@ import com.cloudbees.plugins.credentials.common.StandardCredentials;
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
 import com.cloudbees.plugins.credentials.common.StandardUsernameCredentials;
 import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
+import com.github.benmanes.caffeine.cache.CacheLoader;
+import com.github.benmanes.caffeine.cache.Caffeine;
+import com.github.benmanes.caffeine.cache.LoadingCache;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import hudson.EnvVars;
 import hudson.Extension;
-import hudson.FilePath;
-import hudson.model.AbstractProject;
+import hudson.Util;
 import hudson.model.Item;
-import hudson.model.Job;
 import hudson.model.ParameterDefinition;
 import hudson.model.ParameterValue;
+import hudson.model.TaskListener;
 import hudson.security.ACL;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
-import jenkins.model.Jenkins;
-import net.sf.json.JSONObject;
-import hudson.EnvVars;
 import hudson.util.LogTaskListener;
+import jenkins.model.Jenkins;
+import jenkins.util.SystemProperties;
+import net.sf.json.JSONObject;
+import org.eclipse.jgit.lib.ObjectId;
+import org.eclipse.jgit.lib.Ref;
+import org.eclipse.jgit.lib.Repository;
+import org.eclipse.jgit.revwalk.RevWalk;
+import org.eclipse.jgit.transport.RefSpec;
+import org.eclipse.jgit.transport.URIish;
+import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.gitclient.Git;
 import org.jenkinsci.plugins.gitclient.GitClient;
 import org.jenkinsci.plugins.gitclient.RepositoryCallback;
-import hudson.model.TaskListener;
-import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
-import org.kohsuke.stapler.Stapler;
 import org.kohsuke.stapler.StaplerRequest2;
 import org.kohsuke.stapler.interceptor.RequirePOST;
-import org.eclipse.jgit.transport.RefSpec;
-import org.eclipse.jgit.transport.URIish;
-import org.eclipse.jgit.lib.Repository;
-import org.eclipse.jgit.lib.StoredConfig;
-import org.eclipse.jgit.storage.file.FileRepositoryBuilder;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.*;
+import java.nio.file.Files;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
@@ -54,7 +60,7 @@ import java.util.regex.PatternSyntaxException;
 
 /**
  * Active Git Branches Parameter Definition.
- * 
+ *
  * This parameter plugin dynamically fetches Git branches from a remote repository,
  * sorts them by commit date (descending), and limits the display to the top N branches.
  */
@@ -63,16 +69,23 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
     private static final long serialVersionUID = 1L;
     private static final Logger LOGGER = Logger.getLogger(ActiveGitBranchesParameterDefinition.class.getName());
 
+    private static final String REMOTE_BRANCH_PREFIX = "refs/remotes/origin/";
+
+    /**
+     * Minimum age of a cached branch list before a page load triggers a
+     * background refresh. Bounds how often the controller talks to the Git
+     * server, no matter how often the Build with Parameters page is opened.
+     */
+    static final long REFRESH_INTERVAL_SECONDS = Math.max(1L, SystemProperties.getLong(
+            ActiveGitBranchesParameterDefinition.class.getName() + ".refreshIntervalSeconds", 60L));
+
     // ---------------------------------------------------------------------
-    // Stale-while-revalidate (SWR) cache. Cache lives for the lifetime of
-    // this JVM (cleared on Jenkins restart / plugin reload). Every call to
-    // fetchBranches() returns cached data immediately when available and
-    // kicks off an async refresh; cold start synchronously fetches once.
-    // See discussion in README / chat history for the design rationale.
+    // Stale-while-revalidate cache, keyed by repository + credentials + fetch
+    // mode only, so parameters that differ just in filters share one fetch.
+    // A hit older than REFRESH_INTERVAL_SECONDS is returned immediately while
+    // Caffeine reloads it on REFRESH_EXECUTOR; a miss loads synchronously.
+    // Entries not accessed for a day are evicted.
     // ---------------------------------------------------------------------
-    private static final ConcurrentMap<CacheKey, CacheEntry> CACHE = new ConcurrentHashMap<>();
-    private static final ConcurrentMap<CacheKey, Object> REFRESHING = new ConcurrentHashMap<>();
-    private static final Object REFRESH_IN_FLIGHT = new Object();
     private static final ExecutorService REFRESH_EXECUTOR = Executors.newFixedThreadPool(2, new ThreadFactory() {
         private int counter = 0;
         @Override
@@ -82,6 +95,15 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
             return t;
         }
     });
+    private static final LoadingCache<CacheKey, CacheEntry> CACHE = Caffeine.newBuilder()
+            .maximumSize(500)
+            .expireAfterAccess(Duration.ofDays(1))
+            .refreshAfterWrite(Duration.ofSeconds(REFRESH_INTERVAL_SECONDS))
+            .executor(REFRESH_EXECUTOR)
+            .build(new BranchLoader());
+
+    /** Serializes fetches into the same persistent cache repository. */
+    private static final ConcurrentMap<String, Object> REPO_LOCKS = new ConcurrentHashMap<>();
 
     private final String repositoryUrl;
     private String credentialsId;
@@ -92,7 +114,6 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
     private String defaultValue;
     private boolean useQuickFetch = true;
     private boolean allowCustomBranch = false;
-    private String subdirectory;
 
     /**
      * Sentinel option value sent by index.jelly when user picks "Custom..." entry.
@@ -176,15 +197,6 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
     @DataBoundSetter
     public void setAllowCustomBranch(boolean allowCustomBranch) {
         this.allowCustomBranch = allowCustomBranch;
-    }
-
-    public String getSubdirectory() {
-        return subdirectory;
-    }
-
-    @DataBoundSetter
-    public void setSubdirectory(String subdirectory) {
-        this.subdirectory = subdirectory;
     }
 
     @Override
@@ -288,42 +300,34 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
     }
 
     /**
-     * Returns the branch list shown to the user. Uses a stale-while-revalidate
+     * Returns the branch list shown to the user, filtered and limited
+     * according to this parameter's configuration. Uses a stale-while-revalidate
      * cache:
      * <ul>
-     *   <li><b>Cache hit:</b> return cached snapshot immediately, kick off an
-     *       async background refresh so subsequent calls see fresher data.</li>
+     *   <li><b>Cache hit:</b> return the cached snapshot immediately; if it is
+     *       older than {@link #REFRESH_INTERVAL_SECONDS}, reload it in the
+     *       background so subsequent calls see fresher data.</li>
      *   <li><b>Cache miss (cold start / first call after restart):</b> fetch
-     *       synchronously; on success populate the cache, on failure return an
-     *       empty list and leave the cache empty so the next call retries.</li>
+     *       synchronously; on failure return an empty list and leave the cache
+     *       empty so the next call retries.</li>
      * </ul>
      * Background refresh failures keep the existing cached snapshot intact and
      * only flip {@code lastRefreshFailed} so the UI can warn the user.
      */
     public List<BranchInfo> fetchBranches() {
-        CacheKey key = buildCacheKey();
-        Job<?, ?> currentJob = captureCurrentJob();
-
-        CacheEntry hit = CACHE.get(key);
-        if (hit != null) {
-            triggerBackgroundRefresh(key, currentJob);
-            return hit.branches;
+        if (repositoryUrl == null || repositoryUrl.isBlank()) {
+            return new ArrayList<>();
         }
-
-        // Cold start: synchronous fetch; users will wait once.
         try {
-            List<BranchInfo> fresh = fetchBranchesInternal(currentJob);
-            CACHE.put(key, new CacheEntry(fresh, System.currentTimeMillis(), false));
-            return fresh;
-        } catch (Exception e) {
+            return filterAndLimit(CACHE.get(buildCacheKey()).branches());
+        } catch (RuntimeException e) {
             LOGGER.log(Level.WARNING, "Failed to fetch branches from repository: " + repositoryUrl, e);
             return new ArrayList<>();
         }
     }
 
     private CacheKey buildCacheKey() {
-        return new CacheKey(repositoryUrl, credentialsId, maxBranchCount,
-                branchFilter, alwaysIncludeBranches, excludeBranches, useQuickFetch, subdirectory);
+        return new CacheKey(repositoryUrl, credentialsId, useQuickFetch);
     }
 
     /**
@@ -332,11 +336,11 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
      * the Jelly view to render a "fetched X ago" hint under the dropdown.
      */
     public String getCacheFetchedAgoText() {
-        CacheEntry entry = CACHE.get(buildCacheKey());
+        CacheEntry entry = CACHE.getIfPresent(buildCacheKey());
         if (entry == null) {
             return null;
         }
-        return formatAge(System.currentTimeMillis() - entry.fetchedAt);
+        return formatAge(System.currentTimeMillis() - entry.fetchedAt());
     }
 
     /**
@@ -344,8 +348,8 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
      * view to show a small warning next to the freshness hint.
      */
     public boolean isLastRefreshFailed() {
-        CacheEntry entry = CACHE.get(buildCacheKey());
-        return entry != null && entry.lastRefreshFailed;
+        CacheEntry entry = CACHE.getIfPresent(buildCacheKey());
+        return entry != null && entry.lastRefreshFailed();
     }
 
     private static String formatAge(long ageMs) {
@@ -361,81 +365,19 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
     }
 
     /**
-     * Best-effort lookup of the Job ancestor of the current Stapler request,
-     * if any. The Job reference (not the request) is what the workspace-based
-     * fetch path needs, so we capture it here and pass it down — including to
-     * the background refresh thread, where there is no Stapler request anymore.
+     * Fetches the unfiltered branch list for a cache key, bypassing the cache.
+     * <ul>
+     *   <li>Quick fetch: {@code ls-remote}, fast, sorted alphabetically.</li>
+     *   <li>Otherwise: shallow fetch of the branch tips into a persistent
+     *       repository on the controller, sorted by commit date. Only changed
+     *       tips are transferred after the first fetch.</li>
+     * </ul>
      */
-    private static Job<?, ?> captureCurrentJob() {
-        try {
-            StaplerRequest2 req = Stapler.getCurrentRequest2();
-            if (req == null) return null;
-            return req.findAncestorObject(Job.class);
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    /**
-     * Kick off an async refresh for the given cache key. Deduplicates: only one
-     * refresh per key runs at a time; concurrent callers will all be served
-     * from the existing cache entry without piling up git operations.
-     */
-    private void triggerBackgroundRefresh(CacheKey key, Job<?, ?> job) {
-        if (REFRESHING.putIfAbsent(key, REFRESH_IN_FLIGHT) != null) {
-            return;
-        }
-        REFRESH_EXECUTOR.submit(() -> {
-            try {
-                List<BranchInfo> fresh = fetchBranchesInternal(job);
-                CACHE.put(key, new CacheEntry(fresh, System.currentTimeMillis(), false));
-                LOGGER.fine("Background branch refresh succeeded for " + repositoryUrl);
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING,
-                        "Background branch refresh failed for " + repositoryUrl
-                                + "; keeping previous cached list", e);
-                CacheEntry existing = CACHE.get(key);
-                if (existing != null && !existing.lastRefreshFailed) {
-                    CACHE.replace(key, existing, existing.withRefreshFailed());
-                }
-            } finally {
-                REFRESHING.remove(key);
-            }
-        });
-    }
-
-    /**
-     * Fetches branches from the remote Git repository.
-     * Strategy:
-     * 1. Try workspace fetch + for-each-ref (lightweight fetch + time-sorted) - PREFERRED
-     * 2. If no workspace: use ls-remote (fast, alphabetical) or clone (slow, time-sorted)
-     *
-     * @param job the current Job, used by the workspace fetch path; may be {@code null}
-     *            when running outside a Stapler request (e.g. background refresh) in
-     *            which case the workspace path is skipped.
-     */
-    private List<BranchInfo> fetchBranchesInternal(Job<?, ?> job) throws IOException, InterruptedException {
-        if (repositoryUrl == null || repositoryUrl.isEmpty()) {
+    static List<BranchInfo> fetchAllBranches(CacheKey key) throws IOException, InterruptedException {
+        if (key.repositoryUrl() == null || key.repositoryUrl().isBlank()) {
             throw new IOException("Repository URL is not configured");
         }
-
-        // First, always try workspace-based fetch (lightweight fetch + preserves time sorting)
-        List<BranchInfo> result = tryFetchFromWorkspace(job);
-        if (result != null) {
-            LOGGER.info("Fetched branches from workspace with time-based sorting");
-            return result;
-        }
-
-        // No workspace available, fall back based on useQuickFetch setting
-        if (useQuickFetch) {
-            // Fast but no time sorting
-            LOGGER.info("No workspace available, using ls-remote (alphabetical sort)");
-            return fetchBranchesQuick();
-        } else {
-            // Slow but preserves time sorting
-            LOGGER.info("No workspace available, using clone (time-based sort)");
-            return fetchBranchesWithFullClone();
-        }
+        return key.useQuickFetch() ? fetchBranchesQuick(key) : fetchBranchesWithCacheRepository(key);
     }
 
     /**
@@ -443,515 +385,158 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
      * This is much faster but doesn't provide commit timestamps for sorting.
      * Branches are sorted alphabetically instead.
      */
-    private List<BranchInfo> fetchBranchesQuick() throws IOException, InterruptedException {
-        final List<BranchInfo> branchInfos = new ArrayList<>();
-        
-        StandardCredentials credentials = getCredentials();
-        File tempDir = createTempDirectory();
-        
+    private static List<BranchInfo> fetchBranchesQuick(CacheKey key) throws IOException, InterruptedException {
+        List<BranchInfo> branchInfos = new ArrayList<>();
+        File tempDir = Files.createTempDirectory("jenkins-git-branches-").toFile();
         try {
-            TaskListener listener = new LogTaskListener(LOGGER, Level.INFO);
-            EnvVars env = new EnvVars();
-            
-            GitClient git = Git.with(listener, env)
-                    .in(tempDir)
-                    .using("jgit")
-                    .getClient();
-            
-            if (credentials != null) {
-                git.addCredentials(repositoryUrl, credentials);
-            }
-
-            // Use ls-remote to get remote references without cloning
-            Map<String, org.eclipse.jgit.lib.ObjectId> remoteRefs = git.getRemoteReferences(
-                    repositoryUrl, null, true, false);
-            
-            for (Map.Entry<String, org.eclipse.jgit.lib.ObjectId> entry : remoteRefs.entrySet()) {
-                String refName = entry.getKey();
-                
-                // Filter for branches (refs/heads/...)
+            GitClient git = createGitClient(tempDir, key);
+            Map<String, ObjectId> remoteRefs = git.getRemoteReferences(key.repositoryUrl(), null, true, false);
+            for (String refName : remoteRefs.keySet()) {
                 if (refName.startsWith("refs/heads/")) {
-                    String branchName = refName.substring("refs/heads/".length());
-                    
-                    boolean isAlwaysIncluded = matchesAlwaysInclude(branchName);
-                    
-                    if (!isAlwaysIncluded && !matchesBranchFilter(branchName)) {
-                        continue;
-                    }
-                    
-                    boolean isDisabled = matchesExcludeBranches(branchName);
-                    // Use 0 as commit time since ls-remote doesn't provide it
-                    // Branches will be sorted alphabetically instead
-                    branchInfos.add(new BranchInfo(branchName, 0L, isDisabled));
+                    // ls-remote doesn't provide commit times
+                    branchInfos.add(new BranchInfo(refName.substring("refs/heads/".length()), 0L));
                 }
             }
         } finally {
-            deleteDirectory(tempDir);
+            Util.deleteRecursive(tempDir);
         }
-
-        // Sort alphabetically (since we don't have commit times)
         branchInfos.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
-        
-        return applyLimits(branchInfos);
-    }
-
-    /**
-     * Try to fetch branches from existing Job workspace.
-     * Uses git fetch + for-each-ref which is faster than cloning.
-     * Returns null if workspace is not available, or when {@code job} is
-     * {@code null} (e.g. invoked from a background refresh thread without a
-     * Stapler request, in which case we fall through to ls-remote / clone).
-     */
-    /**
-     * Try to fetch branches from existing Job workspace.
-     * Uses git fetch + for-each-ref which is faster than cloning.
-     * Supports both root workspace and subdirectory repositories (either
-     * auto-detected or explicitly configured via {@code subdirectory}).
-     * Returns null if workspace is not available, or when {@code job} is
-     * {@code null} (e.g. invoked from a background refresh thread without a
-     * Stapler request, in which case we fall through to ls-remote / clone).
-     */
-    private List<BranchInfo> tryFetchFromWorkspace(Job<?, ?> job) {
-        if (job == null) {
-            LOGGER.fine("No Job context available, skipping workspace fetch");
-            return null;
-        }
-        try {
-            // Get workspace
-            FilePath workspace = null;
-            if (job instanceof AbstractProject) {
-                workspace = ((AbstractProject<?, ?>) job).getSomeWorkspace();
-            }
-
-            if (workspace == null || !workspace.exists()) {
-                LOGGER.fine("Workspace not available for job: " + job.getFullName());
-                return null;
-            }
-
-            FilePath gitWorkspace = findGitWorkspace(workspace);
-            if (gitWorkspace == null) {
-                LOGGER.fine("No matching .git repository found in workspace: " + workspace.getRemote());
-                return null;
-            }
-
-            LOGGER.info("Using workspace for branch fetch: " + gitWorkspace.getRemote());
-            return fetchBranchesFromWorkspace(gitWorkspace);
-
-        } catch (Exception e) {
-            LOGGER.log(Level.FINE, "Failed to fetch from workspace, will fall back to clone", e);
-            return null;
-        }
-    }
-
-    /**
-     * Resolves the Git repository directory inside the workspace.
-     * Strategy:
-     * 1. If subdirectory is explicitly configured, check workspace/subdirectory
-     * 2. Check if the root workspace is the matching git repo
-     * 3. Auto-scan direct subdirectories (1 level only) and match remote URL
-     * 4. Fallback to root workspace if root has .git (backward compatibility)
-     */
-    FilePath findGitWorkspace(FilePath workspace) {
-        if (workspace == null) {
-            return null;
-        }
-
-        // 1. Manual subdirectory override
-        if (subdirectory != null && !subdirectory.trim().isEmpty()) {
-            FilePath custom = workspace.child(subdirectory.trim());
-            try {
-                if (custom.exists() && custom.child(".git").exists()) {
-                    LOGGER.info("Using configured subdirectory for branch fetch: " + custom.getRemote());
-                    return custom;
-                } else {
-                    LOGGER.warning("Configured subdirectory does not exist or has no .git: " + custom.getRemote());
-                }
-            } catch (Exception e) {
-                LOGGER.log(Level.FINE, "Error checking configured subdirectory: " + custom.getRemote(), e);
-            }
-        }
-
-        // 2. Check root workspace
-        boolean rootHasGit = false;
-        try {
-            rootHasGit = workspace.child(".git").exists();
-            if (rootHasGit && matchesRemoteUrl(workspace)) {
-                LOGGER.info("Using root workspace for branch fetch: " + workspace.getRemote());
-                return workspace;
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.FINE, "Error checking root .git", e);
-        }
-
-        // 3. Auto-scan direct subdirectories (1 level only)
-        try {
-            List<FilePath> subDirs = workspace.listDirectories();
-            if (subDirs != null) {
-                for (FilePath subDir : subDirs) {
-                    try {
-                        if (subDir.child(".git").exists() && matchesRemoteUrl(subDir)) {
-                            LOGGER.info("Auto-detected matching git repository in subdirectory: " + subDir.getName());
-                            return subDir;
-                        }
-                    } catch (Exception e) {
-                        LOGGER.log(Level.FINE, "Error checking subdirectory: " + subDir.getRemote(), e);
-                    }
-                }
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.FINE, "Failed to scan subdirectories for job workspace: " + workspace.getRemote(), e);
-        }
-
-        // 4. Backward compatibility fallback: if root had .git, use root
-        if (rootHasGit) {
-            LOGGER.info("Using root workspace as fallback: " + workspace.getRemote());
-            return workspace;
-        }
-
-        return null;
-    }
-
-    /**
-     * Checks if the directory is a git repository that matches the target repository URL.
-     */
-    boolean matchesRemoteUrl(FilePath dir) {
-        if (repositoryUrl == null || repositoryUrl.trim().isEmpty()) {
-            return false;
-        }
-        try {
-            File dirFile = new File(dir.getRemote());
-            File gitEntry = new File(dirFile, ".git");
-            if (!gitEntry.exists()) {
-                return false;
-            }
-            FileRepositoryBuilder builder = new FileRepositoryBuilder();
-            if (gitEntry.isDirectory()) {
-                builder.setGitDir(gitEntry);
-            } else {
-                builder.setWorkTree(dirFile).findGitDir(dirFile);
-            }
-            try (Repository repo = builder.build()) {
-                StoredConfig config = repo.getConfig();
-                Set<String> remotes = repo.getRemoteNames();
-                for (String remote : remotes) {
-                    String[] urls = config.getStringList("remote", remote, "url");
-                    if (urls != null) {
-                        for (String url : urls) {
-                            if (url != null && isSameGitUrl(url, repositoryUrl)) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                String originUrl = config.getString("remote", "origin", "url");
-                if (originUrl != null && isSameGitUrl(originUrl, repositoryUrl)) {
-                    return true;
-                }
-            }
-        } catch (Exception e) {
-            LOGGER.log(Level.FINE, "Failed to inspect git remote in " + dir.getRemote(), e);
-        }
-        return false;
-    }
-
-    /**
-     * Compares two Git repository URLs for equivalence, ignoring protocol differences,
-     * leading/trailing slashes, and .git extensions.
-     */
-    static boolean isSameGitUrl(String url1, String url2) {
-        if (url1 == null || url2 == null) {
-            return false;
-        }
-        String u1Trimmed = url1.trim();
-        String u2Trimmed = url2.trim();
-        if (u1Trimmed.equalsIgnoreCase(u2Trimmed)) {
-            return true;
-        }
-
-        try {
-            URIish u1 = new URIish(u1Trimmed);
-            URIish u2 = new URIish(u2Trimmed);
-            String host1 = u1.getHost();
-            String host2 = u2.getHost();
-            if (host1 != null && host2 != null && !host1.equalsIgnoreCase(host2)) {
-                return false;
-            }
-            String path1 = normalizeGitPath(u1.getPath());
-            String path2 = normalizeGitPath(u2.getPath());
-            if (!path1.isEmpty() && path1.equalsIgnoreCase(path2)) {
-                return true;
-            }
-        } catch (Exception e) {
-            // Fall back to simple path comparison if URIish parsing fails
-        }
-
-        String norm1 = normalizeGitPath(u1Trimmed);
-        String norm2 = normalizeGitPath(u2Trimmed);
-        return !norm1.isEmpty() && norm1.equalsIgnoreCase(norm2);
-    }
-
-    static String normalizeGitPath(String path) {
-        if (path == null) {
-            return "";
-        }
-        String p = path.trim().replace('\\', '/');
-        int colonIdx = p.indexOf(':');
-        if (colonIdx > 0 && !p.startsWith("http://") && !p.startsWith("https://") && !p.startsWith("file://")) {
-            p = p.substring(colonIdx + 1);
-        }
-        while (p.startsWith("/")) {
-            p = p.substring(1);
-        }
-        while (p.endsWith("/")) {
-            p = p.substring(0, p.length() - 1);
-        }
-        if (p.endsWith(".git")) {
-            p = p.substring(0, p.length() - 4);
-        }
-        while (p.endsWith("/")) {
-            p = p.substring(0, p.length() - 1);
-        }
-        return p;
-    }
-
-    /**
-     * Fetch branches from an existing workspace.
-     * Performs a lightweight fetch to update refs, then reads local refs.
-     * Returns null if no local refs found (caller should fall back to other methods).
-     */
-    private List<BranchInfo> fetchBranchesFromWorkspace(FilePath workspace) throws IOException, InterruptedException {
-        File workspaceDir = new File(workspace.getRemote());
-        
-        TaskListener listener = new LogTaskListener(LOGGER, Level.INFO);
-        EnvVars env = new EnvVars();
-        
-        GitClient git = Git.with(listener, env)
-                .in(workspaceDir)
-                .using("jgit")
-                .getClient();
-        
-        // Add credentials if available
-        StandardCredentials credentials = getCredentials();
-        if (credentials != null) {
-            git.addCredentials(repositoryUrl, credentials);
-        }
-        
-        // Fetch latest refs from remote with RefSpec and prune
-        // - RefSpec: get ALL branches including new ones
-        // - Prune: remove refs that no longer exist on remote
-        try {
-            RefSpec refSpec = new RefSpec("+refs/heads/*:refs/remotes/origin/*");
-            git.fetch_()
-                .from(new URIish(repositoryUrl), Collections.singletonList(refSpec))
-                .prune(true)
-                .execute();
-            LOGGER.info("Fetched latest refs from remote (with RefSpec + prune)");
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, "Failed to fetch from remote, using cached refs", e);
-        }
-        
-        // Read local refs (now up-to-date)
-        List<BranchInfo> localRefs = readLocalRefs(git);
-        if (!localRefs.isEmpty()) {
-            LOGGER.info("Using local refs (" + localRefs.size() + " branches)");
-            return applyLimits(localRefs);
-        }
-        
-        // No local refs found, return null to fall back to other methods
-        LOGGER.info("No local refs found in workspace, will use fallback method");
-        return null;
-    }
-
-    /**
-     * Read local refs from the repository without any network operation.
-     * Returns empty list if no refs found or repository is invalid.
-     */
-    private List<BranchInfo> readLocalRefs(GitClient git) {
-        final List<BranchInfo> branchInfos = new ArrayList<>();
-        
-        try {
-            git.withRepository(new RepositoryCallback<Void>() {
-                @Override
-                public Void invoke(org.eclipse.jgit.lib.Repository repo, hudson.remoting.VirtualChannel channel) throws IOException {
-                    try (org.eclipse.jgit.revwalk.RevWalk walk = new org.eclipse.jgit.revwalk.RevWalk(repo)) {
-                        List<org.eclipse.jgit.lib.Ref> allRefs = repo.getRefDatabase().getRefsByPrefix("refs/remotes/origin/");
-                        for (org.eclipse.jgit.lib.Ref ref : allRefs) {
-                            String branchName = ref.getName().substring("refs/remotes/origin/".length());
-                            
-                            if (branchName.equals("HEAD")) continue;
-                            
-                            boolean isAlwaysIncluded = matchesAlwaysInclude(branchName);
-                            if (!isAlwaysIncluded && !matchesBranchFilter(branchName)) {
-                                continue;
-                            }
-                            
-                            boolean isDisabled = matchesExcludeBranches(branchName);
-                            try {
-                                org.eclipse.jgit.revwalk.RevCommit commit = walk.parseCommit(ref.getObjectId());
-                                long commitTime = commit.getCommitTime() * 1000L;
-                                branchInfos.add(new BranchInfo(branchName, commitTime, isDisabled));
-                            } catch (Exception e) {
-                                branchInfos.add(new BranchInfo(branchName, 0L, isDisabled));
-                            }
-                        }
-                    }
-                    return null;
-                }
-            });
-        } catch (Exception e) {
-            LOGGER.log(Level.FINE, "Failed to read local refs", e);
-            return new ArrayList<>();
-        }
-        
-        // Sort by commit date descending
-        branchInfos.sort((a, b) -> Long.compare(b.getCommitTime(), a.getCommitTime()));
         return branchInfos;
     }
 
     /**
-     * Full clone to get commit timestamps (slowest but always works).
+     * Fetches branch tips into a repository under
+     * {@code $JENKINS_HOME/caches/active-git-branches/} that is reused across
+     * refreshes, then reads commit times from it.
      */
-    private List<BranchInfo> fetchBranchesWithFullClone() throws IOException, InterruptedException {
-        final List<BranchInfo> branchInfos = new ArrayList<>();
-        
-        StandardCredentials credentials = getCredentials();
-        File tempDir = createTempDirectory();
-        
-        try {
-            TaskListener listener = new LogTaskListener(LOGGER, Level.INFO);
-            EnvVars env = new EnvVars();
-            
-            GitClient git = Git.with(listener, env)
-                    .in(tempDir)
-                    .using("jgit")
-                    .getClient();
-            
-            if (credentials != null) {
-                git.addCredentials(repositoryUrl, credentials);
+    private static List<BranchInfo> fetchBranchesWithCacheRepository(CacheKey key) throws IOException, InterruptedException {
+        File repoDir = new File(Jenkins.get().getRootDir(),
+                "caches/active-git-branches/" + Util.getDigestOf(key.repositoryUrl()));
+        synchronized (REPO_LOCKS.computeIfAbsent(repoDir.getAbsolutePath(), k -> new Object())) {
+            GitClient git = createGitClient(repoDir, key);
+            // Non-bare because git-client always opens <dir>/.git; nothing is ever checked out
+            if (!new File(repoDir, ".git/HEAD").isFile()) {
+                Util.deleteRecursive(repoDir);
+                Files.createDirectories(repoDir.toPath());
+                git.init_().workspace(repoDir.getAbsolutePath()).execute();
             }
-
-            // Clone the repository (shallow for performance)
-            git.clone_()
-                    .url(repositoryUrl)
-                    .repositoryName("origin")
-                    .shallow(true)
-                    .execute();
-            
-            // Access the repository to iterate branches and get commit dates
-            git.withRepository(new RepositoryCallback<Void>() {
-                @Override
-                public Void invoke(org.eclipse.jgit.lib.Repository repo, hudson.remoting.VirtualChannel channel) throws IOException, InterruptedException {
-                    try (org.eclipse.jgit.revwalk.RevWalk walk = new org.eclipse.jgit.revwalk.RevWalk(repo)) {
-                        List<org.eclipse.jgit.lib.Ref> allRefs = repo.getRefDatabase().getRefs();
-                        for (org.eclipse.jgit.lib.Ref ref : allRefs) {
-                            String refName = ref.getName();
-                            
-                            // Filter for remote branches (refs/remotes/origin/...)
-                            if (refName.startsWith("refs/remotes/origin/")) {
-                                String branchName = refName.substring("refs/remotes/origin/".length());
-                                
-                                // Skip HEAD
-                                if (branchName.equals("HEAD")) continue;
-                                
-                                // Apply branch filter
-                                boolean isAlwaysIncluded = matchesAlwaysInclude(branchName);
-                                
-                                if (!isAlwaysIncluded && !matchesBranchFilter(branchName)) {
-                                    continue;
-                                }
-                                
-                                boolean isDisabled = matchesExcludeBranches(branchName);
-                                try {
-                                    org.eclipse.jgit.revwalk.RevCommit commit = walk.parseCommit(ref.getObjectId());
-                                    long commitTime = commit.getCommitTime() * 1000L;
-                                    branchInfos.add(new BranchInfo(branchName, commitTime, isDisabled));
-                                } catch (Exception e) {
-                                    // If we can't parse commit, treat as old
-                                    branchInfos.add(new BranchInfo(branchName, 0L, isDisabled));
-                                }
-                            }
-                        }
-                    }
-                    return null;
-                }
-            });
-
-        } finally {
-            deleteDirectory(tempDir);
+            try {
+                git.fetch_()
+                        .from(new URIish(key.repositoryUrl()),
+                                Collections.singletonList(new RefSpec("+refs/heads/*:" + REMOTE_BRANCH_PREFIX + "*")))
+                        .prune(true)
+                        .shallow(true)
+                        .depth(1)
+                        .execute();
+            } catch (java.net.URISyntaxException e) {
+                throw new IOException("Invalid repository URL: " + key.repositoryUrl(), e);
+            }
+            List<BranchInfo> branchInfos = git.withRepository(new ReadBranchesCallback());
+            branchInfos.sort((a, b) -> Long.compare(b.getCommitTime(), a.getCommitTime()));
+            return branchInfos;
         }
+    }
 
-        // Sort by commit date descending
-        branchInfos.sort((a, b) -> Long.compare(b.getCommitTime(), a.getCommitTime()));
-        
-        return applyLimits(branchInfos);
+    private static GitClient createGitClient(File dir, CacheKey key) throws IOException, InterruptedException {
+        TaskListener listener = new LogTaskListener(LOGGER, Level.FINE);
+        GitClient git = Git.with(listener, new EnvVars()).in(dir).using("jgit").getClient();
+        StandardCredentials credentials = lookupCredentials(key.repositoryUrl(), key.credentialsId());
+        if (credentials != null) {
+            git.addCredentials(key.repositoryUrl(), credentials);
+        }
+        return git;
+    }
+
+    /** Reads {@code refs/remotes/origin/*} with the commit time of each tip. */
+    private static final class ReadBranchesCallback implements RepositoryCallback<List<BranchInfo>> {
+        private static final long serialVersionUID = 1L;
+
+        @Override
+        public List<BranchInfo> invoke(Repository repo, hudson.remoting.VirtualChannel channel) throws IOException {
+            List<BranchInfo> branchInfos = new ArrayList<>();
+            try (RevWalk walk = new RevWalk(repo)) {
+                for (Ref ref : repo.getRefDatabase().getRefsByPrefix(REMOTE_BRANCH_PREFIX)) {
+                    String branchName = ref.getName().substring(REMOTE_BRANCH_PREFIX.length());
+                    if (branchName.equals("HEAD")) continue;
+                    long commitTime = 0L;
+                    try {
+                        commitTime = walk.parseCommit(ref.getObjectId()).getCommitTime() * 1000L;
+                    } catch (IOException e) {
+                        // If we can't parse commit, treat as old
+                    }
+                    branchInfos.add(new BranchInfo(branchName, commitTime));
+                }
+            }
+            return branchInfos;
+        }
     }
 
     /**
-     * Apply maxBranchCount limit while respecting alwaysIncludeBranches.
+     * Applies branchFilter, alwaysIncludeBranches, excludeBranches and
+     * maxBranchCount to an unfiltered, already sorted branch list.
      */
-    private List<BranchInfo> applyLimits(List<BranchInfo> branchInfos) {
-        if (branchInfos.size() <= maxBranchCount) {
-            return branchInfos;
-        }
+    List<BranchInfo> filterAndLimit(List<BranchInfo> allBranches) {
+        Pattern filter = compileOrNull(branchFilter, "branch filter");
+        Pattern alwaysInclude = compileOrNull(alwaysIncludeBranches, "always include branches");
+        Pattern exclude = compileOrNull(excludeBranches, "exclude branches");
 
-        if (alwaysIncludeBranches == null || alwaysIncludeBranches.trim().isEmpty()) {
-            return new ArrayList<>(branchInfos.subList(0, maxBranchCount));
-        }
-
+        List<BranchInfo> filtered = new ArrayList<>();
         List<BranchInfo> mandatory = new ArrayList<>();
         List<BranchInfo> others = new ArrayList<>();
-
-        for (BranchInfo info : branchInfos) {
-            if (matchesAlwaysInclude(info.getName())) {
-                mandatory.add(info);
+        for (BranchInfo info : allBranches) {
+            String name = info.getName();
+            boolean isAlwaysIncluded = alwaysInclude != null && alwaysInclude.matcher(name).matches();
+            if (!isAlwaysIncluded && filter != null && !filter.matcher(name).matches()) {
+                continue;
+            }
+            boolean isDisabled = exclude != null && exclude.matcher(name).matches();
+            BranchInfo branch = new BranchInfo(name, info.getCommitTime(), isDisabled);
+            filtered.add(branch);
+            if (isAlwaysIncluded) {
+                mandatory.add(branch);
             } else {
-                others.add(info);
+                others.add(branch);
             }
         }
 
+        if (filtered.size() <= maxBranchCount) {
+            return filtered;
+        }
+
+        // Always-included branches first, then fill remaining slots with the others
         List<BranchInfo> result = new ArrayList<>(mandatory);
-
-        // Fill remaining slots with others
         int slotsLeft = maxBranchCount - mandatory.size();
-        if (slotsLeft > 0) {
-            for (int i = 0; i < slotsLeft && i < others.size(); i++) {
-                result.add(others.get(i));
-            }
+        for (int i = 0; i < slotsLeft && i < others.size(); i++) {
+            result.add(others.get(i));
         }
-
         return result;
     }
-    
-    private boolean matchesAlwaysInclude(String branchName) {
-        if (alwaysIncludeBranches == null || alwaysIncludeBranches.trim().isEmpty()) {
-            return false;
+
+    private static Pattern compileOrNull(String regex, String what) {
+        if (regex == null || regex.isBlank()) {
+            return null;
         }
         try {
-            Pattern pattern = Pattern.compile(alwaysIncludeBranches.trim());
-            return pattern.matcher(branchName).matches();
+            return Pattern.compile(regex.trim());
         } catch (PatternSyntaxException e) {
-            return false;
+            LOGGER.fine("Ignoring invalid " + what + " regex: " + regex);
+            return null;
         }
     }
 
     public boolean matchesExcludeBranches(String branchName) {
-        if (excludeBranches == null || excludeBranches.trim().isEmpty() || branchName == null || branchName.isEmpty()) {
+        if (branchName == null || branchName.isEmpty()) {
             return false;
         }
-        try {
-            Pattern pattern = Pattern.compile(excludeBranches.trim());
-            return pattern.matcher(branchName).matches();
-        } catch (PatternSyntaxException e) {
-            LOGGER.warning("Invalid exclude branches regex: " + excludeBranches);
-            return false;
-        }
+        Pattern pattern = compileOrNull(excludeBranches, "exclude branches");
+        return pattern != null && pattern.matcher(branchName).matches();
     }
 
-    private StandardCredentials getCredentials() {
+    private static StandardCredentials lookupCredentials(String repositoryUrl, String credentialsId) {
         if (credentialsId == null || credentialsId.isEmpty()) {
             return null;
         }
-        
+
         return CredentialsMatchers.firstOrNull(
                 com.cloudbees.plugins.credentials.CredentialsProvider.lookupCredentials(
                         StandardCredentials.class,
@@ -963,46 +548,9 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
         );
     }
 
-
-    private boolean matchesBranchFilter(String branchName) {
-        if (branchFilter == null || branchFilter.trim().isEmpty()) {
-            return true;
-        }
-        
-        try {
-            Pattern pattern = Pattern.compile(branchFilter);
-            return pattern.matcher(branchName).matches();
-        } catch (PatternSyntaxException e) {
-            LOGGER.warning("Invalid branch filter regex: " + branchFilter);
-            return true;
-        }
-    }
-
-    private File createTempDirectory() throws IOException {
-        File tempDir = File.createTempFile("jenkins-git-branches-", "");
-        tempDir.delete();
-        tempDir.mkdirs();
-        return tempDir;
-    }
-
-    private void deleteDirectory(File directory) {
-        if (directory != null && directory.exists()) {
-            File[] files = directory.listFiles();
-            if (files != null) {
-                for (File file : files) {
-                    if (file.isDirectory()) {
-                        deleteDirectory(file);
-                    } else {
-                        file.delete();
-                    }
-                }
-            }
-            directory.delete();
-        }
-    }
-
     /**
-     * Branch information holder.
+     * Branch information holder. Kept as a JavaBean (not a record) because
+     * index.jelly reads {@code branch.name} / {@code branch.disabled}.
      */
     public static class BranchInfo {
         private final String name;
@@ -1033,55 +581,11 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
     }
 
     /**
-     * Identifies a cached branch list. Two parameter definitions whose
-     * cache-affecting fields are all equal share the same cache entry, so two
-     * Jobs configured against the same repository (with the same credentials,
-     * filters, etc.) benefit from each other's warm cache.
+     * Identifies a cached, unfiltered branch list. Filters are applied per
+     * parameter on read, so every parameter pointing at the same repository
+     * with the same credentials and fetch mode shares one fetch.
      */
-    static final class CacheKey {
-        private final String repositoryUrl;
-        private final String credentialsId;
-        private final int maxBranchCount;
-        private final String branchFilter;
-        private final String alwaysIncludeBranches;
-        private final String excludeBranches;
-        private final boolean useQuickFetch;
-        private final String subdirectory;
-
-        CacheKey(String repositoryUrl, String credentialsId, int maxBranchCount,
-                 String branchFilter, String alwaysIncludeBranches, String excludeBranches,
-                 boolean useQuickFetch, String subdirectory) {
-            this.repositoryUrl = repositoryUrl;
-            this.credentialsId = credentialsId;
-            this.maxBranchCount = maxBranchCount;
-            this.branchFilter = branchFilter;
-            this.alwaysIncludeBranches = alwaysIncludeBranches;
-            this.excludeBranches = excludeBranches;
-            this.useQuickFetch = useQuickFetch;
-            this.subdirectory = subdirectory;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (!(o instanceof CacheKey)) return false;
-            CacheKey other = (CacheKey) o;
-            return maxBranchCount == other.maxBranchCount
-                    && useQuickFetch == other.useQuickFetch
-                    && Objects.equals(repositoryUrl, other.repositoryUrl)
-                    && Objects.equals(credentialsId, other.credentialsId)
-                    && Objects.equals(branchFilter, other.branchFilter)
-                    && Objects.equals(alwaysIncludeBranches, other.alwaysIncludeBranches)
-                    && Objects.equals(excludeBranches, other.excludeBranches)
-                    && Objects.equals(subdirectory, other.subdirectory);
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(repositoryUrl, credentialsId, maxBranchCount,
-                    branchFilter, alwaysIncludeBranches, excludeBranches, useQuickFetch, subdirectory);
-        }
-    }
+    record CacheKey(String repositoryUrl, String credentialsId, boolean useQuickFetch) {}
 
     /**
      * Immutable cached snapshot. {@code lastRefreshFailed} signals that the
@@ -1089,19 +593,32 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
      * background refresh hit an error; the data itself is kept around so the UI
      * keeps working.
      */
-    static final class CacheEntry {
-        final List<BranchInfo> branches;
-        final long fetchedAt;
-        final boolean lastRefreshFailed;
-
-        CacheEntry(List<BranchInfo> branches, long fetchedAt, boolean lastRefreshFailed) {
-            this.branches = Collections.unmodifiableList(new ArrayList<>(branches));
-            this.fetchedAt = fetchedAt;
-            this.lastRefreshFailed = lastRefreshFailed;
+    record CacheEntry(List<BranchInfo> branches, long fetchedAt, boolean lastRefreshFailed) {
+        CacheEntry {
+            branches = List.copyOf(branches);
         }
 
         CacheEntry withRefreshFailed() {
             return new CacheEntry(branches, fetchedAt, true);
+        }
+    }
+
+    private static final class BranchLoader implements CacheLoader<CacheKey, CacheEntry> {
+        @Override
+        public CacheEntry load(@NonNull CacheKey key) throws Exception {
+            return new CacheEntry(fetchAllBranches(key), System.currentTimeMillis(), false);
+        }
+
+        @Override
+        public CacheEntry reload(@NonNull CacheKey key, @NonNull CacheEntry oldValue) {
+            try {
+                return load(key);
+            } catch (Exception e) {
+                LOGGER.log(Level.WARNING, "Background branch refresh failed for " + key.repositoryUrl()
+                        + "; keeping previous cached list", e);
+                // Always a new instance so Caffeine restarts the refresh interval
+                return oldValue.withRefreshFailed();
+            }
         }
     }
 
@@ -1121,7 +638,7 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
         // Validates caller-supplied string input only; returns no private data and has no side effects.
         @SuppressWarnings({"lgtm[jenkins/no-permission-check]", "lgtm[jenkins/csrf]"})
         public FormValidation doCheckRepositoryUrl(@QueryParameter String value) {
-            if (value == null || value.trim().isEmpty()) {
+            if (value == null || value.isBlank()) {
                 return FormValidation.error("Repository URL is required");
             }
             if (!value.startsWith("http://") && !value.startsWith("https://") && 
@@ -1137,7 +654,7 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
         // Validates caller-supplied numeric input only; returns no private data and has no side effects.
         @SuppressWarnings({"lgtm[jenkins/no-permission-check]", "lgtm[jenkins/csrf]"})
         public FormValidation doCheckMaxBranchCount(@QueryParameter String value) {
-            if (value == null || value.trim().isEmpty()) {
+            if (value == null || value.isBlank()) {
                 return FormValidation.error("Max branch count is required");
             }
             try {
@@ -1160,7 +677,7 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
         // Validates caller-supplied regex input only; returns no private data and has no side effects.
         @SuppressWarnings({"lgtm[jenkins/no-permission-check]", "lgtm[jenkins/csrf]"})
         public FormValidation doCheckBranchFilter(@QueryParameter String value) {
-            if (value == null || value.trim().isEmpty()) {
+            if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
             try {
@@ -1177,7 +694,7 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
         // Validates caller-supplied regex input only; returns no private data and has no side effects.
         @SuppressWarnings({"lgtm[jenkins/no-permission-check]", "lgtm[jenkins/csrf]"})
         public FormValidation doCheckAlwaysIncludeBranches(@QueryParameter String value) {
-            if (value == null || value.trim().isEmpty()) {
+            if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
             try {
@@ -1194,7 +711,7 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
         // Validates caller-supplied regex input only; returns no private data and has no side effects.
         @SuppressWarnings({"lgtm[jenkins/no-permission-check]", "lgtm[jenkins/csrf]"})
         public FormValidation doCheckExcludeBranches(@QueryParameter String value) {
-            if (value == null || value.trim().isEmpty()) {
+            if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
             try {
@@ -1252,11 +769,11 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
                                                @QueryParameter String branchFilter,
                                                @QueryParameter String alwaysIncludeBranches,
                                                @QueryParameter String excludeBranches,
-                                               @QueryParameter String subdirectory) {
+                                               @QueryParameter boolean useQuickFetch) {
             if (!hasConfigurePermission(item)) {
                 return FormValidation.ok();
             }
-            if (repositoryUrl == null || repositoryUrl.trim().isEmpty()) {
+            if (repositoryUrl == null || repositoryUrl.isBlank()) {
                 return FormValidation.error("Repository URL is required");
             }
 
@@ -1267,12 +784,11 @@ public class ActiveGitBranchesParameterDefinition extends ParameterDefinition {
             tempDef.setBranchFilter(branchFilter);
             tempDef.setAlwaysIncludeBranches(alwaysIncludeBranches);
             tempDef.setExcludeBranches(excludeBranches);
-            tempDef.setSubdirectory(subdirectory);
+            tempDef.setUseQuickFetch(useQuickFetch);
 
             try {
-                // testConnection is invoked from the config page where no Job context
-                // is meaningful for the workspace fetch path, so pass null.
-                List<BranchInfo> branches = tempDef.fetchBranchesInternal(null);
+                // Bypass the cache so the result reflects the current form values and server state
+                List<BranchInfo> branches = tempDef.filterAndLimit(fetchAllBranches(tempDef.buildCacheKey()));
                 if (branches.isEmpty()) {
                     return FormValidation.warning("Connection successful, but no branches found matching the filter");
                 }

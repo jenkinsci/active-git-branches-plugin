@@ -4,7 +4,8 @@
 
     <st:adjunct includes="io.jenkins.plugins.activegitbranches.ActiveGitBranchesParameterDefinition.active-git-branches" />
 
-    <f:entry title="${it.name}" description="${it.description}">
+    <j:set var="escapeEntryTitleAndDescription" value="false"/>
+    <f:entry title="${h.escape(it.name)}" description="${it.formattedDescription}">
         <div name="parameter" class="active-git-branches-parameter" data-agb-name="${it.name}">
             <input type="hidden" name="name" value="${it.name}" />
             <j:set var="branches" value="${it.fetchBranches()}" />
