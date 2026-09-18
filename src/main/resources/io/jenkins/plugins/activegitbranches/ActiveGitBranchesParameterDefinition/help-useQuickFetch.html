@@ -1,16 +1,13 @@
 <div>
-  <p>Controls the fallback behavior when no workspace is available.</p>
-  <p><strong>Fetch Strategy (in order of preference):</strong></p>
-  <ol>
-    <li><strong>Local refs</strong> (instant): Reads cached refs from existing <code>.git</code> directory. 
-        No network required, instant response, time-sorted.</li>
-    <li><strong>Workspace fetch</strong>: If no local refs, fetches from remote with 30s timeout.</li>
-    <li><strong>Fallback</strong> (when no workspace):
-      <ul>
-        <li><strong>Enabled (default):</strong> Uses <code>ls-remote</code>. Very fast (~1s), alphabetical sort.</li>
-        <li><strong>Disabled:</strong> Uses shallow clone. Slow (10+s), time-sorted.</li>
-      </ul>
-    </li>
-  </ol>
-  <p><em>Tip: Run a build first to populate local refs, then "Build with Parameters" will be instant with time-based sorting.</em></p>
+  <p>Controls how the branch list is fetched from the repository.</p>
+  <ul>
+    <li><strong>Enabled (default):</strong> Uses <code>ls-remote</code>. Very fast, no data is downloaded,
+        but branches are sorted alphabetically.</li>
+    <li><strong>Disabled:</strong> Fetches only the latest commit of each branch into a cache repository
+        on the controller (<code>$JENKINS_HOME/caches/active-git-branches</code>) and sorts branches by
+        commit date. The first fetch takes longer; later refreshes only download changed branch tips.</li>
+  </ul>
+  <p>In both modes the result is cached. Opening "Build with Parameters" shows the cached list immediately
+     and refreshes it in the background at most once per minute (configurable with the system property
+     <code>io.jenkins.plugins.activegitbranches.ActiveGitBranchesParameterDefinition.refreshIntervalSeconds</code>).</p>
 </div>

@@ -46,16 +46,10 @@
         <f:textbox />
     </f:entry>
 
-    <f:advanced>
-        <f:entry title="${%Subdirectory}" field="subdirectory">
-            <f:textbox placeholder="Auto-detected if blank (e.g. backend)" />
-        </f:entry>
-    </f:advanced>
-
     <f:entry title="">
         <f:validateButton title="${%Test Connection}" progress="${%Testing...}"
                           method="testConnection" 
-                          with="repositoryUrl,credentialsId,maxBranchCount,branchFilter,alwaysIncludeBranches,excludeBranches,subdirectory" />
+                          with="repositoryUrl,credentialsId,maxBranchCount,branchFilter,alwaysIncludeBranches,excludeBranches,useQuickFetch" />
     </f:entry>
 
 </j:jelly>

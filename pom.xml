@@ -81,6 +81,12 @@
             <artifactId>ssh-credentials</artifactId>
         </dependency>
 
+        <!-- Caffeine API Plugin for the branch cache -->
+        <dependency>
+            <groupId>io.jenkins.plugins</groupId>
+            <artifactId>caffeine-api</artifactId>
+        </dependency>
+
         <!-- SCM API Plugin -->
         <dependency>
             <groupId>org.jenkins-ci.plugins</groupId>
@@ -101,13 +107,4 @@
             <url>https://repo.jenkins-ci.org/public/</url>
         </pluginRepository>
     </pluginRepositories>
-
-    <build>
-        <plugins>
-            <plugin>
-                <groupId>org.jenkins-ci.tools</groupId>
-                <artifactId>maven-hpi-plugin</artifactId>
-            </plugin>
-        </plugins>
-    </build>
 </project>
