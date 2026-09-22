@@ -8,6 +8,13 @@
 
 It is designed for teams with busy repositories and many feature/release branches, where the normal branch dropdown quickly becomes noisy.
 
+> [!IMPORTANT]
+> **To sort branches by recent commit activity, turn off `useQuickFetch`.**
+> The default (`useQuickFetch: true`) lists branches with `ls-remote`, which is fast but can only
+> sort alphabetically. With `useQuickFetch: false` the plugin fetches just the latest commit of each
+> branch into a cache repository on the controller and sorts by commit date. The first fetch takes a
+> few seconds; after that only changed branch tips are transferred.
+
 ## ❓ Why This Plugin?
 
 Most Git branch parameter solutions can list branches. This plugin focuses on making the list useful when the repository is busy.
