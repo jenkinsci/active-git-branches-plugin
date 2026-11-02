@@ -14,6 +14,16 @@
 > 设为 `false` 后，插件只把每个分支的最新提交拉取到 Controller 上的缓存仓库，并按提交时间排序。
 > 首次获取需要几秒，之后只下载有变化的分支。
 
+## 实际效果
+
+![真实 Jenkins 演示：快速找到活跃分支，同时保留并禁选保护分支](docs/images/active-branches-demo.gif)
+
+[查看静态截图](docs/images/active-branches-demo.png)
+
+基于本地 Jenkins、真实插件和示例 Git 仓库的操作截图制作动图：原来按字母排列的 33 个 feature 分支，在开启活跃排序并限制为 5 项后，收敛为 **最近更新的 3 个 feature 分支 + 2 个保护分支**。`main` 和 `release/1.0` 保持可见，但不能选择。
+
+演示对比的是本插件的两种配置。触发数量限制时，强制保留的分支会占用名额并排在最近活跃分支之前。[演示配置与录制说明](docs/demo/README.md)。
+
 ## 为什么选择这个插件？
 
 很多 Jenkins 插件都能“列出 Git 分支”。这个插件关注的是：当仓库分支很多时，怎样让用户更快选到正确分支，并减少误选风险。
@@ -76,6 +86,8 @@
 
 ### Declarative Pipeline
 
+下面两个示例均显式设置 `useQuickFetch: false`，按分支最近提交时间排序。使用时请替换仓库地址和凭据 ID。
+
 ```groovy
 pipeline {
     agent any
@@ -85,6 +97,7 @@ pipeline {
             repositoryUrl: 'https://github.com/your-org/your-repo.git',
             credentialsId: 'github-credentials',
             maxBranchCount: 10,
+            useQuickFetch: false,
             branchFilter: 'feature/.*',
             alwaysIncludeBranches: 'main|develop',
             excludeBranches: 'main|master',
@@ -113,6 +126,7 @@ properties([
             name: 'BRANCH',
             repositoryUrl: 'https://github.com/your-org/your-repo.git',
             maxBranchCount: 15,
+            useQuickFetch: false,
             description: 'Select a branch'
         )
     ])

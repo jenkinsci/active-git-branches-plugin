@@ -15,6 +15,17 @@ It is designed for teams with busy repositories and many feature/release branche
 > branch into a cache repository on the controller and sorts by commit date. The first fetch takes a
 > few seconds; after that only changed branch tips are transferred.
 
+## See it in action
+
+![Real Jenkins demo: find recent branches and keep protected branches visible](docs/images/active-branches-demo.gif)
+
+[Static preview](docs/images/active-branches-demo.png)
+
+Animated walkthrough made from real interaction screenshots in a local Jenkins instance with this plugin and a sample Git repository:
+33 feature branches in alphabetical mode become **3 recently updated feature branches + 2 protected branches** with an activity-sorted, five-entry limit. `main` and `release/1.0` stay visible but cannot be selected.
+
+The demo compares two configurations of this plugin. Always-included branches occupy slots in the limit and appear before the recent branches when the limit applies. [Demo setup and capture details](docs/demo/README.md).
+
 ## ❓ Why This Plugin?
 
 Most Git branch parameter solutions can list branches. This plugin focuses on making the list useful when the repository is busy.
@@ -89,6 +100,8 @@ Install **Active Git Branches Parameter** from **Manage Jenkins → Plugins → 
 
 ### 📜 Pipeline (Declarative)
 
+Both examples explicitly set `useQuickFetch: false` so recent commit activity determines branch order. Replace the repository URL and credentials ID with your own values.
+
 ```groovy
 pipeline {
     agent any
@@ -98,6 +111,7 @@ pipeline {
             repositoryUrl: 'https://github.com/your-org/your-repo.git',
             credentialsId: 'github-credentials',
             maxBranchCount: 10,
+            useQuickFetch: false,
             branchFilter: 'feature/.*',
             alwaysIncludeBranches: 'main|develop',
             excludeBranches: 'main|master',
@@ -126,6 +140,7 @@ properties([
             name: 'BRANCH',
             repositoryUrl: 'https://github.com/your-org/your-repo.git',
             maxBranchCount: 15,
+            useQuickFetch: false,
             description: 'Select a branch'
         )
     ])
